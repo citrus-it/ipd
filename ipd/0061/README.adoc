@@ -30,13 +30,16 @@ to make, and some rough notes on the overall structure here.
 == Background
 
 The `AF_VSOCK` provides a transport between a guest and a hypervisor.
-Where as our normal networks are identified by IP addresses, different
+Whereas our normal networks are identified by IP addresses, different
 entities are identified by opaque unsigned 32-bit context IDs called
 CIDs. There are a few well known CIDs in the system:
 
-* `VMADDR_CID_ANY` (`UINT32_MAX`): this CID basically says bind to any CID.
-  Generally applications are encouraged to do this to avoid needing to
-  know about the current CID.
+# There's a slight mix of terminology here, mixing "bind" and "talk to" #
+# I tweaked the first one but perhaps use "represent" or similar throughout? #
+
+* `VMADDR_CID_ANY` (`UINT32_MAX`): this CID represents any CID.
+  Generally applications are encouraged to bind(3SOCKET) to this to avoid
+  needing to know about the current CID.
 * `VMADDR_CID_HYPERVISOR` (0): This says to talk to services in the
   hypervisor.
 * `VMADDR_CID_LOCAL` (1): This says to talk to the local virtual
@@ -47,6 +50,8 @@ CIDs. There are a few well known CIDs in the system:
 The transport specifications generally only define a subset of these as
 well known CIDs. For example, the virtio spec leaves values of 0 and 1
 reserved and only defines `VMADDR_CID_HOST`.
+
+# Since it's unsigned, should we say `UINT_MAX` for the port instead of -1? #
 
 On top of this, ports are used, just like in IP. The system is supposed
 to treat ports below 1024 as privileged ports. Similar to other network
@@ -111,7 +116,7 @@ zero, there is no logic in Linux that enforces it today.
 
 Local CID discovery is performed on Linux by performing an ioctl on the
 `/dev/vsock` device using the `IOCTL_VM_SOCKETS_GET_LOCAL_CID` command.
-This is the only currently defined means of getting this information. 
+This is the only currently defined means of getting this information.
 
 === Local CID Assignment
 
@@ -235,8 +240,10 @@ use the next available AF value, which is currently 33. Note, this value
 is not compatible with Linux's default value. Unfortunately it's
 generally difficult and these values are going to always end up being
 OS-specific. There are not generally gaps in the AF space with the
-definition of `AF_MAX. Even if we wanted to pick say the Linux value of
+definition of `AF_MAX`. Even if we wanted to pick say the Linux value of
 `AF_VSOCK` as 40, other OSes have used that value.
+# Other OSes have used that value for something else, or should this say #
+# NOT used that value for AF_VSOCK? #
 
 . To contain all of the various vsock related constants we need a header
 file to define the socket address format and related. On Linux this is
@@ -287,10 +294,16 @@ field at the start of the `svm_zero`.
 . For compatibility purposes, we will implement similar socket options
 to those that Linux implements today and actually has definitions for.
 These will use the same values for the options. In addition, we will use
-the same source-compatible level `AF_UNIX`, though this has a distinct
+the same source-compatible level `AF_VSOCK`, though this has a distinct
 ABI value per the earlier discussion. Any illumos-specific socket
 options that we opt to add will use their own level: `SOL_VSOCK` to give
 us a different namespace to ensure we don't end up conflicting. The
+
+# Should we consider the implications of ensuring that `SOL_VSOCK` is #
+# or is not 40 (I assume it would not be 40)? There will surely be #
+# applications with hard-coded values and a note here might be appropriate #
+# in the same way we've talked about `AV_VSOCK` #
+
 following socket options are current planned:
 +
 [options="header",cols=3]
@@ -314,7 +327,10 @@ second set of allocated space for this system. Effectively, our initial
 proposal is that setting `SO_VM_SOCKETS_BUFFER_SIZE` be equivalent to
 setting `SO_SNDBUF` and `SO_RCVBUF` on the socket. The tuning we should
 allow on the MIN and MAX isn't clear. There likely need to be stack-wide
-defaults. What tuning-is allowed is not clear.
+defaults. What tuning is allowed is not clear.
+
+# I assume we are happy that we don't have individual control over `SO_SNDBUF` #
+# and `SO_RCVBUF` here? #
 
 ==== Standard Socket Options
 
@@ -430,6 +446,8 @@ However, this then means things like observability become challenging.
 In addition, while it would be quite strange to have more than one
 transport backend, it is is strictly possible with virtio appearing as a
 PCI device, albeit it would be quite odd.
+# Probably doesn't need the ", albeit..." bit given the sentence already #
+# has "while it would be quite strange" #
 
 To make this subsystem more understandable, we propose the idea of
 having named transport-based devices which one can discover an address
@@ -582,7 +600,7 @@ The following table summarizes the probes that we will add:
 | Probe | Type | Description
 | send | all | Fires whenever a packet is transmitted over an interface,
 including loopback.
-| recieve | all | Fires whenever a packet is received over an interface,
+| receive | all | Fires whenever a packet is received over an interface,
 including loopback.
 | accept-established | connection-oriented | Fires whenever a listening
 socket successfully accepts a new connection.
@@ -703,7 +721,7 @@ Domain sockets. We would need to extend support to cover vsock here.
 Here are the different ways we would want to extend netstat:
 +
 * Running `netstat` without arguments would include `AF_VSOCK` data in
-  its won section.
+  its own section.
 * Add vsock as an address family to the `-f` flag to indicate
   `AF_VSOCK`. As the filter form of `-f` is only used with the routing
   table we would not modify extend the filters for `AF_VSOCK` as there
@@ -722,6 +740,9 @@ Here are the different ways we would want to extend netstat:
 * The form of protocol filter (`-P`) here is not clear. We may want to
   add aliases for `stream`, `seqpacket`, and related. Forcing someone to
   use `tcp` or `udp` for example, would be very confusing with vsock.
+# Technically this is a different semantic (socket type vs. protocol name) #
+# and I found myself thinking through the `-f` and `-P` interaction a bit #
+# more. Probably nothing actionable here, just thinking out loud. #
 * We expect `-u` to map things to processes to work the same.
 
 [[sec-proc]]
