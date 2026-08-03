@@ -132,7 +132,7 @@ unrelated to the process being authenticated:
   job control in the user's shell, are unaffected. The helper then
   authenticates the user via https://illumos.org/man/3PAM/pam[pam(3PAM)]
   and generates the audit record.
-- If authentication succeeds, `pfexecd`'s reply carries the attribute
+- If authentication succeeds, the reply from `pfexecd` carries the attribute
   overrides from the user's full profile set, and instructs the kernel to
   set the `PRIV_PFEXEC_AUTH` flag on the new process credentials, so that
   commands executed from an authenticated process (for example a profile
