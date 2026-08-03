@@ -111,13 +111,39 @@ unauthenticated profile sets for the user, in that order, and return the
 attribute overrides as necessary.
 
 If, however, the flag is **not** set, then the authenticated set will be
-inspected first and, if a match is found, a reply sent to the kernel
-indicating that authentication is required. In this case, the kernel will
-not execute the original command directly, but will instead invoke an
-_interpreter_ - `pfauth`. This process will authenticate the user
-via https://illumos.org/man/3PAM/pam[pam(3PAM)]. If authentication is
-successful, the `PRIV_PFEXEC_AUTH` flag will be set and the authentication
-helper will re-exec the original command.
+inspected first and, if a match is found, the user is authenticated before
+`pfexecd` tells the kernel whether the command may proceed. Authentication
+happens synchronously, within the upcall, and in a process tree which is
+unrelated to the process being authenticated:
+
+- `pfexecd` replies to the initial upcall indicating that authentication
+  is required.
+- The kernel repeats the upcall, this time attaching a door descriptor for
+  the calling process's controlling terminal, opened in-kernel in the same
+  way as an open of `/dev/tty` by the caller. If the caller has no
+  controlling terminal then the authenticated profile set is not consulted
+  at all, and only the unauthenticated profiles apply.
+- `pfexecd` runs a helper process - `pfauth` - handing it the terminal.
+  The helper grafts the terminal onto its own session using a new terminal
+  ioctl, `TIOCGRAFT`, so that `/dev/tty` resolves to it; this is required
+  by getpassphrase(3C), used in the PAM conversation, and by any PAM
+  module which opens the terminal directly. The graft is one-way - the
+  terminal's own session and foreground process group bindings, and hence
+  job control in the user's shell, are unaffected. The helper then
+  authenticates the user via https://illumos.org/man/3PAM/pam[pam(3PAM)]
+  and generates the audit record.
+- If authentication succeeds, `pfexecd`'s reply carries the attribute
+  overrides from the user's full profile set, and instructs the kernel to
+  set the `PRIV_PFEXEC_AUTH` flag on the new process credentials, so that
+  commands executed from an authenticated process (for example a profile
+  shell) do not prompt again, and so that the flag is visible to
+  `chkauthattr_ucred()`. If authentication fails, the reply denies
+  execution and the exec(2) fails with `EACCES`.
+
+Because the process being authenticated remains blocked in exec(2)
+throughout, and never itself executes any interim helper, its environment
+is never exposed to a privileged component and is passed unchanged to the
+final target, subject to the usual pfexec scrubbing rules.
 
 
 [source]
@@ -125,52 +151,43 @@ helper will re-exec the original command.
      Userspace              |                  Kernel
      ---------              |                  ------
                             |
-                            |                     +------------------------+
-                            |                     |                        |
-                            |                     |                        |
-+-----------------------+   |   +-----------------|-------------------+    |
-| pfexec                |   |   |                 |                   |    |
-|                       |   |   |                 |                   |    |
-|  setpflag(PRIV_PFEXEC)|   |   |                 |                   |    |
-|                       |   |   |                 v                   |    |
-|  call exec(2)         +-------+-------------> exec()                |    |
-+-----------------------+   |   |                 |                   |    |
-                            |   |                 |                   |    |
-+-----------------------+   |   |                 v                   |    |
-| pfexecd               <-------+--------- upcall to pfexecd          |    |
-|                       |   |   |                                     |    |
-|  getexecuser()        +-------+---------> apply attributes(1)       |    |
-+-----------------------+   |   |           (privs/auths/IDs)         |    |
-                            |   |                 |                   |    |
-                            |   |                 v                   |   (2)
-                            |   |            auth required?           |    |
-                            |   |                |  |                 |    |
-                            |   |                |  |                 |    |
-                            |   |             +--+  +--+              |    |
-                            |   |             |        |              |    |
-                            |   |             v        v              |    |
-+------------------------+  |   |            YES       NO             |    |
-| pfauth                 |  |   |             |        |              |    |
-|                        |  |   |             v        v              |    |
-|   authenticate (PAM)   <------+-- exec pfauth        continue exec  |    |
-|   setpflag(PFEXEC_AUTH)|  |   |   (as interp)              |        |    |
-|   exec(original cmd)   |  |   |                            |        |    |
-+----------+-------------+  |   +----------------------------+--------+    |
-           |                |                                v             |
-           |                                                               |
-           +--------------------------------------------------------------->
++-----------------------+   |
+| pfexec                |   |
+|  setpflag(PRIV_PFEXEC)|   |
+|  call exec(2)         +--------------------> exec()
++-----------------------+   |                    |
+                            |                    v
++-----------------------+   |             upcall to pfexecd
+| pfexecd               <------------------------+
+|                       |   |
+|  getexecuser()        |   |
+|  auth required?       |   |
+|   NO: reply with      +--------------------> apply attributes(1)
+|       attributes      |   |                  (privs/auths/IDs)
+|   YES: request the    |   |                    |
+|       terminal        <---------- repeat upcall with ctty fd
+|                       |   |                    |
+|   fork pfauth ---+    |   |                    |
++------------------|----+   |                    |
+                   v        |                    |
++-----------------------+   |                    |
+| pfauth                |   |                    |
+|  setsid()             |   |                    |
+|  ioctl(TIOCGRAFT)     |   |                    |
+|  authenticate (PAM)   |   |                    |
+|  audit, exit status   |   |                    |
++-----------+-----------+   |                    |
+            |               |                    |
+   pfexecd replies:         |                    v
+   allowed + attributes(1)  |             continue exec of the
+   + set PRIV_PFEXEC_AUTH,  |             original command, with
+   or denied                |             the caller's environment
 ----
 
-1. pfexecd will also specify any additional privileges that should be
-   given to the `pfauth` helper in order that it can properly use PAM and
-   set the `PRIV_PFEXEC_AUTH` flag following successful authentication.
-   Since this is an increase in privileges, pfexecd will also tell the
-   kernel to scrub the process environment, as already happens when pfexec
-   changes owner or group.
-
-2. On this second pass through, pfexecd will see the authentication status
-   and include authenticated profiles when checking for additional
-   Authorisations and exec attributes to assign.
+1. When replying after a successful authentication, pfexecd includes the
+   authenticated profiles when checking for additional Authorisations and
+   exec attributes to assign, and the kernel records the authentication
+   by setting the `PRIV_PFEXEC_AUTH` flag in the new process credentials.
 
 == PAM Authentication
 
